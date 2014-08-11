@@ -4,6 +4,7 @@ import FileSieve.BusinessLogic.FileEnumeration.DiscoveredPath;
 
 import javax.swing.SwingWorker;
 import java.io.IOException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -39,6 +40,16 @@ public final class SwingCopyJob {
     private final Comparator<Path> fileComparator;
     private final AtomicBoolean backgroundThreadIsRunning = new AtomicBoolean(false);
     private SwingCopyJobException internalWorkerException = null;
+    private int fileCopyThreadLimit;
+
+    public void setFileCopyThreadLimit(int fileCopyThreadLimit) {
+        this.fileCopyThreadLimit = fileCopyThreadLimit;
+        worker.setFileCopyThreadLimit(fileCopyThreadLimit);
+    }
+
+    public int getFileCopyThreadLimit() {
+        return this.fileCopyThreadLimit;
+    }
 
     /**
      * Extracts the decorated (wrapped) Path from a DiscoveredPath instance.
@@ -57,10 +68,11 @@ public final class SwingCopyJob {
     /**
      * Static factory method for creating or retrieving a reference to an equivalent (ongoing) SwingCopyJob.
      *
-     * @param pathsToBeCopied           a list of Path objects abstracting folders and/or files to copy
+     * @param pathsToBeCopied           list of Path objects abstracting folders and/or files to copy
      * @param destinationFolder         destination folder to which file and folder copies are to be placed
      * @param recursiveCopy             boolean value specifying if a recursive search for files/folders within subfolders of folders within the pathsToBeCopied list should be carried out
      * @param overwriteExistingFiles    indicates if existing files in the target path should be overwritten if found to be similar to those currently being copied
+     * @param fileCopyThreadLimit       maximum number of concurrent file copy operations
      * @param fileComparator            Function object of type Comparator<Path> defining a compare method with which
      *                                  to compare two files. The compare method should define what it means for two
      *                                  regular files to be the same. If the method evaluates to 0 (equal) then the
@@ -74,7 +86,7 @@ public final class SwingCopyJob {
      * @throws IllegalStateException    thrown if the destination folder is being written to by a dissimilar copy job
      * @throws IOException              thrown if an IOException is encountered while converting source paths to real paths
      */
-    protected static SwingCopyJob getCopyJob(Set<Path> pathsToBeCopied, Path destinationFolder, boolean recursiveCopy, boolean overwriteExistingFiles, Comparator<Path> fileComparator, SwingCopyJobListener swingCopyJobListener) throws IllegalStateException, IOException {
+    protected static SwingCopyJob getCopyJob(Set<Path> pathsToBeCopied, Path destinationFolder, boolean recursiveCopy, boolean overwriteExistingFiles, int fileCopyThreadLimit, Comparator<Path> fileComparator, SwingCopyJobListener swingCopyJobListener) throws IllegalStateException, IOException {
         if (pathsToBeCopied == null) {
             throw new IllegalArgumentException("null reference passed for \"pathsToBeCopied\" parameter");
         }
@@ -106,7 +118,7 @@ public final class SwingCopyJob {
 
         /* Create a SwingCopyJob from the passed parameters but don't start (execute) its SwingWorker yet whereas we
            want to check for the existence of a similar ongoing job. */
-        SwingCopyJob newJob = new SwingCopyJob(realPaths, destinationFolder, recursiveCopy, overwriteExistingFiles, fileComparator, swingCopyJobListener);
+        SwingCopyJob newJob = new SwingCopyJob(realPaths, destinationFolder, recursiveCopy, overwriteExistingFiles, fileCopyThreadLimit, fileComparator, swingCopyJobListener);
 
         synchronized (swingCopyJobs) {
             // Ensure a similar job is not already in progress
@@ -156,6 +168,7 @@ public final class SwingCopyJob {
      * @param pathsBeingCopied          list (Set<Path>) of pathnames of folders and/or files to copy
      * @param destinationFolder         pathname of folder into which to copy sourcePathnames items
      * @param recursiveCopy             boolean value specifying if a recursive search for files/folders within subfolders of folders within the pathsToBeCopied list should be carried out
+     * @param fileCopyThreadLimit       maximum number of concurrent file copy operations
      * @param overwriteExistingFiles    indicates if files pre-existing files found in the target path should be overwritten if the fileComparator determines that they are different than their
      *                                  source path equivalents
      * @param fileComparator            Function object of type Comparator<Path> defining a compare method with which
@@ -168,11 +181,12 @@ public final class SwingCopyJob {
      *                                  length in bytes.
      * @param swingCopyJobListener      a reference to a CopyJobListener which is to receive copy job progress updates
      */
-    private SwingCopyJob(Set<Path> pathsBeingCopied, Path destinationFolder, boolean recursiveCopy, boolean overwriteExistingFiles, Comparator<Path> fileComparator, SwingCopyJobListener swingCopyJobListener) {
+    private SwingCopyJob(Set<Path> pathsBeingCopied, Path destinationFolder, boolean recursiveCopy, boolean overwriteExistingFiles, int fileCopyThreadLimit, Comparator<Path> fileComparator, SwingCopyJobListener swingCopyJobListener) {
         this.pathsBeingCopied = pathsBeingCopied;
         this.destinationFolder = destinationFolder;
         this.recursiveCopy = recursiveCopy;
         this.overwriteExistingFiles = overwriteExistingFiles;
+        this.fileCopyThreadLimit = fileCopyThreadLimit;
 
         if (fileComparator == null) {
             this.fileComparator = DefaultFileComparator.getInstance();
@@ -320,8 +334,7 @@ public final class SwingCopyJob {
 
     /**
      * Updates the EDT on copy job progress. This class' background thread handles forwarding of job updates to the
-     * EDT. It delegates actual folder and file creation in the destination folder to a background thread (an
-     * instance of CopyJobWorkDelegate).
+     * EDT. It delegates actual folder and file creation in the destination folder to a an instance of CopyJobWorkDelegate.
      */
     private class EdtUpdater extends SwingWorker<Void, SimpleImmutableEntry<Path, Integer>> implements CopyWorkResultsReceiver {
 
@@ -332,13 +345,20 @@ public final class SwingCopyJob {
         private final AtomicReference<Exception> workerException = new AtomicReference<>(null);
         private final Object swingUpdaterLock = new Object();
         private final AtomicBoolean workCompleted = new AtomicBoolean(false);
-        private final ConcurrentLinkedQueue<SimpleImmutableEntry<Path, Integer>> workResultsQueue = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<SimpleImmutableEntry<Path, Long>> workResultsQueue = new ConcurrentLinkedQueue<>();
         private final AtomicBoolean jobCancelled = new AtomicBoolean(false);
+        private int totalBytes = 0;
+        private long copiedBytes = 0L;
+        private int totalPercentCopied = 0;
 
         protected boolean cancelWork() {
             boolean result = !jobCancelled.getAndSet(true);
-            copyJobWorkDelegate.cancelWork();
+            copyJobWorkDelegate.stopWorkers();
             return result;
+        }
+
+        protected void setFileCopyThreadLimit(int fileCopyThreadLimit) {
+            copyJobWorkDelegate.setFileCopyThreadLimit(fileCopyThreadLimit);
         }
 
         /**
@@ -354,7 +374,7 @@ public final class SwingCopyJob {
 
             this.thisSwingCopyJob = enclosingSwingCopyJob;
 
-            copyJobWorkDelegate = new CopyJobWorkDelegate(this, pathsBeingCopied, destinationFolder, recursiveCopy, overwriteExistingFiles, fileComparator);
+            copyJobWorkDelegate = new CopyJobWorkDelegate(this, pathsBeingCopied, destinationFolder, recursiveCopy, overwriteExistingFiles, fileCopyThreadLimit, fileComparator);
             myWorker = new Thread(copyJobWorkDelegate);
             myWorker.setName("CopyJobDelegate");
         }
@@ -370,7 +390,7 @@ public final class SwingCopyJob {
         }
 
         @Override   // CopyWorkResultsReceiver
-        public void receiveWorkResults(SimpleImmutableEntry<Path, Integer> result) {
+        public void receiveWorkResults(SimpleImmutableEntry<Path, Long> result) {
             workResultsQueue.add(result);
 
             // Notify worker thread of work received
@@ -405,20 +425,43 @@ public final class SwingCopyJob {
         public Void doInBackground() throws IllegalStateException, SecurityException, IOException, InterruptedException {
             backgroundThreadIsRunning.set(true);
 
+            try {
+                for (Path path : pathsBeingCopied) {
+                    if (extractPath(path).toFile().exists()) {
+                        retrieveTotalBytes(path);
+                    } else {
+                        throw new IllegalStateException("source pathname does not exist");
+                    }
+                }
+            } catch (SecurityException e) {
+                throw new SecurityException("SecurityException while calculating bytes to copy", e);
+            } catch (IOException e) {
+                throw new IOException("IOException while calculating bytes to copy", e);
+            }
+
             // Start the CopyJobWorkDelegate and wait for its completion, or an exception, to be thrown
             myWorker.start();
 
             while ((myWorker.isAlive()) && (!workCompleted.get())) {
-                synchronized(swingUpdaterLock) {
+                synchronized (swingUpdaterLock) {
                     swingUpdaterLock.wait();
                 }
 
-                SimpleImmutableEntry<Path, Integer> result;
+                SimpleImmutableEntry<Path, Long> result;
                 while ((result = workResultsQueue.poll()) != null) {
                     if (result.getKey().equals(destinationFolder)) {
-                        setProgress(result.getValue());
+                        /* Update copy job's overall progress and publish the current percent-completion if the
+                           percentage has changed */
+                        long previousPercentCopied = totalPercentCopied;
+                        copiedBytes += result.getValue();
+                        totalPercentCopied = (int) (copiedBytes * ONE_HUNDRED_PERCENT / totalBytes);
+                        if ((totalPercentCopied != previousPercentCopied) && (totalPercentCopied < ONE_HUNDRED_PERCENT)) {
+                            setProgress(totalPercentCopied);
+                            publish(new SimpleImmutableEntry<>(destinationFolder, totalPercentCopied));
+                        }
+                    } else {
+                        publish(new SimpleImmutableEntry<>(result.getKey(), result.getValue().intValue()));
                     }
-                    publish(result);
                 }
 
                 Exception e = workerException.get();
@@ -429,6 +472,8 @@ public final class SwingCopyJob {
                         throw (IOException) e;
                     } else if (e instanceof IllegalStateException) {
                         throw (IllegalStateException) e;
+                    } else if (e instanceof InterruptedException) {
+                        throw (InterruptedException) e;
                     } else {
                         throw new RuntimeException(e.getMessage(), e);
                     }
@@ -523,6 +568,25 @@ public final class SwingCopyJob {
             // Unblock a caller of the awaitCompletion() method is the enclosing class
             synchronized (lockObject) {
                 lockObject.notify();
+            }
+        }
+
+        private void retrieveTotalBytes(Path sourcePathname) throws SecurityException, IOException {
+            if (Files.isDirectory(extractPath(sourcePathname))) {
+                try (DirectoryStream<Path> dirStream = Files.newDirectoryStream(extractPath(sourcePathname))) {
+                    for (Path path : dirStream) {
+                        if (!jobCancelled.get()) {
+                            // Exclude target folder if it is a subfolder of the source folder
+                            if (Files.isDirectory(extractPath(path), LinkOption.NOFOLLOW_LINKS) && (!path.equals(destinationFolder) && recursiveCopy)) {
+                                retrieveTotalBytes(path);
+                            } else if (Files.isRegularFile(extractPath(path), LinkOption.NOFOLLOW_LINKS)) {
+                                totalBytes += path.toFile().length();
+                            }
+                        }
+                    }
+                }
+            } else {
+                totalBytes += sourcePathname.toFile().length();
             }
         }
 
